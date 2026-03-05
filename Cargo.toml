@@ -1,0 +1,35 @@
+[package]
+name = "trustd"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Rust implementation of the TrustFnCall in-guest trust daemon"
+
+[features]
+default = ["vsock"]
+vsock = ["dep:tokio-vsock"]
+
+[dependencies]
+async-stream = "0.3.6"
+base64 = "0.22.1"
+clap = { version = "4.5.50", features = ["derive"] }
+futures-core = "0.3.31"
+hex = "0.4.3"
+nix = { version = "0.29.0", features = ["poll", "process", "signal"] }
+prost = "0.13.5"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+thiserror = "2.0.12"
+tokio = { version = "1.44.2", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1.17", features = ["net", "sync"] }
+tokio-util = "0.7.15"
+tokio-vsock = { version = "0.7.2", optional = true }
+tonic = { version = "0.12.3", features = ["transport"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+
+[build-dependencies]
+tonic-build = "0.12.3"
+
+[dev-dependencies]
+tempfile = "3.19.1"

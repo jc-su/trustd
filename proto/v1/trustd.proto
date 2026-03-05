@@ -1,0 +1,215 @@
+// Copyright 2025 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+// gRPC service definition for trustd.
+// trustd runs inside a TDX Confidential VM and bridges kernel
+// IMA container measurements to the host-side virt-handler via vsock.
+
+syntax = "proto3";
+
+package trustd.v1;
+
+option go_package = "github.com/trustfncall/trustd/proto/v1;trustdv1";
+
+// Trustd is the gRPC service exposed by the in-guest daemon over vsock.
+// virt-handler on the host connects to this service to collect attestation
+// evidence from containers running inside the CVM.
+service Trustd {
+  // AttestContainer performs atomic attestation of a single container.
+  // Returns RTMR3, measurement log, and optional TD Quote.
+  rpc AttestContainer(AttestContainerRequest) returns (AttestContainerResponse);
+
+  // ListContainers returns all tracked containers and their current state.
+  rpc ListContainers(ListContainersRequest) returns (ListContainersResponse);
+
+  // GetContainerState returns the current state of a specific container.
+  rpc GetContainerState(GetContainerStateRequest) returns (ContainerState);
+
+  // WatchContainerEvents streams real-time container events (measurements,
+  // liveness heartbeats, heartbeat misses) to the caller.
+  rpc WatchContainerEvents(WatchEventsRequest) returns (stream ContainerEvent);
+
+  // GetTDQuote requests a TDX TD Quote for given reportdata.
+  // Uses the TSM configfs interface in the kernel.
+  rpc GetTDQuote(GetTDQuoteRequest) returns (GetTDQuoteResponse);
+
+  // Ping checks daemon liveness.
+  rpc Ping(PingRequest) returns (PingResponse);
+
+  // StartHeartbeatMonitor enables heartbeat timeout detection for a container.
+  // Heartbeats are reported explicitly via ReportHeartbeat.
+  rpc StartHeartbeatMonitor(HeartbeatMonitorRequest) returns (HeartbeatMonitorResponse);
+
+  // StopHeartbeatMonitor disables heartbeat timeout detection for a container.
+  rpc StopHeartbeatMonitor(HeartbeatMonitorStopRequest) returns (HeartbeatMonitorStopResponse);
+
+  // ReportHeartbeat reports one liveness heartbeat for a container.
+  rpc ReportHeartbeat(HeartbeatReportRequest) returns (HeartbeatReportResponse);
+
+  // RestartContainer requests in-guest remediation by restarting processes
+  // in the container cgroup. A follow-up measurement event should be emitted
+  // by the kernel once the container runtime recreates the container.
+  rpc RestartContainer(GetContainerStateRequest) returns (ContainerState);
+}
+
+// AttestContainerRequest triggers attestation of a specific container.
+message AttestContainerRequest {
+  // Container identifier (cgroup path inside the CVM).
+  string cgroup_path = 1;
+
+  // Nonce from the verifier (hex-encoded). Binds attestation to challenge.
+  string nonce_hex = 2;
+
+  // Whether to include a TD Quote in the response.
+  bool include_td_quote = 3;
+}
+
+// AttestContainerResponse contains the attestation evidence for one container.
+message AttestContainerResponse {
+  // Container cgroup path.
+  string cgroup_path = 1;
+
+  // Current RTMR3 value (hex-encoded, 96 chars for SHA-384).
+  string rtmr3 = 2;
+
+  // Initial RTMR3 value at container creation (hex-encoded).
+  string initial_rtmr3 = 3;
+
+  // Number of measurements extended into RTMR3.
+  int64 measurement_count = 4;
+
+  // Individual measurement log entries.
+  repeated ContainerMeasurement measurements = 5;
+
+  // Reportdata = SHA384(nonce || rtmr3), hex-encoded.
+  string report_data = 6;
+
+  // Nonce echo (hex-encoded).
+  string nonce = 7;
+
+  // Optional: TDX TD Quote (binary, base64-encoded).
+  // Only present if include_td_quote was true in the request.
+  bytes td_quote = 8;
+
+  // Timestamp of the attestation (seconds since epoch).
+  int64 timestamp = 9;
+}
+
+// ContainerMeasurement represents a single file measurement.
+message ContainerMeasurement {
+  // SHA-384 digest of the measured file (hex-encoded).
+  string digest = 1;
+
+  // Path of the measured file.
+  string file = 2;
+}
+
+// ListContainersRequest lists all tracked containers.
+message ListContainersRequest {}
+
+// ListContainersResponse contains all tracked container states.
+message ListContainersResponse {
+  repeated ContainerState containers = 1;
+}
+
+// GetContainerStateRequest queries a specific container.
+message GetContainerStateRequest {
+  string cgroup_path = 1;
+}
+
+// ContainerState represents the current state of a tracked container.
+message ContainerState {
+  string cgroup_path = 1;
+  string rtmr3 = 2;
+  string initial_rtmr3 = 3;
+  int64 measurement_count = 4;
+  int64 last_heartbeat = 5;       // seconds since epoch, 0 if never
+  int64 heartbeat_count = 6;
+  bool heartbeat_monitoring = 7;
+}
+
+// WatchEventsRequest subscribes to container events.
+message WatchEventsRequest {
+  // Optional: filter to specific event types. Empty = all events.
+  repeated EventType event_types = 1;
+
+  // Optional: filter to specific cgroup path. Empty = all containers.
+  string cgroup_path = 2;
+}
+
+// EventType mirrors the kernel's IMA_CN_EVENT_* constants.
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  EVENT_TYPE_NEW = 1;
+  EVENT_TYPE_MEASUREMENT = 2;
+  EVENT_TYPE_HEARTBEAT = 3;
+  EVENT_TYPE_HEARTBEAT_MISS = 4;
+  EVENT_TYPE_REMOVED = 5;
+  EVENT_TYPE_ATTEST_BEGIN = 6;
+  EVENT_TYPE_ATTEST_END = 7;
+}
+
+// ContainerEvent is streamed to subscribers.
+message ContainerEvent {
+  EventType event_type = 1;
+  string cgroup_path = 2;
+  int64 timestamp = 3;
+
+  // For MEASUREMENT events:
+  string digest = 4;
+  string filename = 5;
+
+  // For HEARTBEAT_MISS:
+  string detail = 6;
+
+  // Current RTMR3 at event time (hex):
+  string rtmr3 = 7;
+  int64 measurement_count = 8;
+}
+
+// GetTDQuoteRequest asks trustd to obtain a TD Quote.
+message GetTDQuoteRequest {
+  // Report data to include in the quote (64 bytes, base64-encoded).
+  bytes report_data = 1;
+}
+
+// GetTDQuoteResponse contains the TD Quote.
+message GetTDQuoteResponse {
+  // TDX TD Quote (binary).
+  bytes td_quote = 1;
+}
+
+// PingRequest is a liveness check.
+message PingRequest {}
+
+// PingResponse confirms the agent is alive.
+message PingResponse {
+  string version = 1;
+  int64 uptime_seconds = 2;
+  int64 containers_tracked = 3;
+}
+
+// HeartbeatMonitorRequest enables heartbeat timeout detection.
+message HeartbeatMonitorRequest {
+  string cgroup_path = 1;
+  uint32 timeout_seconds = 2;  // 0 = use kernel default (90s)
+}
+
+// HeartbeatMonitorResponse confirms monitoring was started.
+message HeartbeatMonitorResponse {}
+
+// HeartbeatMonitorStopRequest disables heartbeat monitoring.
+message HeartbeatMonitorStopRequest {
+  string cgroup_path = 1;
+}
+
+// HeartbeatMonitorStopResponse confirms monitoring was stopped.
+message HeartbeatMonitorStopResponse {}
+
+// HeartbeatReportRequest reports one liveness heartbeat for a container.
+message HeartbeatReportRequest {
+  string cgroup_path = 1;
+}
+
+// HeartbeatReportResponse confirms heartbeat ingestion.
+message HeartbeatReportResponse {}
