@@ -4,10 +4,13 @@
 pub mod config;
 pub mod error;
 pub mod event_bus;
+pub mod lifecycle;
 pub mod liveness;
 pub mod remediation;
+pub mod runtime;
 pub mod securityfs;
 pub mod service;
+pub mod spec_store;
 pub mod state;
 pub mod tdquote;
 pub mod unix_rpc;

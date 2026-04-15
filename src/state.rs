@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::SystemTime;
 
+use crate::lifecycle::Phase;
+
 const DEFAULT_HEARTBEAT_TIMEOUT_SECONDS: u32 = 90;
 
 /// In-memory snapshot of one tracked container.
@@ -19,6 +21,10 @@ pub struct ContainerState {
     pub heartbeat_timeout_seconds: u32,
     heartbeat_monitor_started_at: Option<SystemTime>,
     heartbeat_miss_active: bool,
+    // Lifecycle fields (populated only for containers started via StartContainer).
+    pub phase: Phase,
+    pub container_name: String,
+    pub container_id: String,
 }
 
 impl ContainerState {
@@ -36,7 +42,17 @@ impl ContainerState {
             heartbeat_timeout_seconds: DEFAULT_HEARTBEAT_TIMEOUT_SECONDS,
             heartbeat_monitor_started_at: None,
             heartbeat_miss_active: false,
+            phase: Phase::Unmanaged,
+            container_name: String::new(),
+            container_id: String::new(),
         }
+    }
+
+    fn new_lifecycle(name: impl Into<String>) -> Self {
+        let mut s = Self::new("");
+        s.container_name = name.into();
+        s.phase = Phase::Pending;
+        s
     }
 }
 
@@ -166,6 +182,66 @@ impl StateManager {
             .read()
             .expect("state manager lock poisoned on count")
             .len()
+    }
+
+    // ---- Lifecycle integration ----
+
+    /// Set the phase for a lifecycle-managed container (keyed by name).
+    /// If the container doesn't exist yet, creates a new Pending entry.
+    /// If `cgroup_path` is non-empty, updates the entry's cgroup binding.
+    pub fn set_phase(&self, name: &str, phase: Phase, cgroup_path: &str) {
+        let mut guard = self
+            .containers
+            .write()
+            .expect("state manager lock poisoned on set_phase");
+
+        // Lifecycle containers are tracked both by name and by cgroup path.
+        // First, find by name. If not found, create.
+        let key = self.find_key_by_name(&guard, name)
+            .unwrap_or_else(|| {
+                // No entry yet — we'll insert under a placeholder key that we
+                // replace once we know the real cgroup path.
+                let placeholder = format!("__lifecycle__{name}");
+                guard.insert(placeholder.clone(), ContainerState::new_lifecycle(name));
+                placeholder
+            });
+
+        if let Some(state) = guard.get_mut(&key) {
+            state.phase = phase;
+            state.last_updated = SystemTime::now();
+
+            // If the caller provides a cgroup path and the current key is a
+            // placeholder, re-key the entry under the real cgroup path.
+            if !cgroup_path.is_empty() && key.starts_with("__lifecycle__") {
+                let entry = guard.remove(&key).unwrap();
+                let mut entry = entry;
+                entry.cgroup_path = cgroup_path.to_string();
+                guard.insert(cgroup_path.to_string(), entry);
+            } else if !cgroup_path.is_empty() {
+                state.cgroup_path = cgroup_path.to_string();
+            }
+        }
+    }
+
+    /// Look up a container by name (O(n) scan — fine for <100 containers).
+    pub fn get_by_name(&self, name: &str) -> Option<ContainerState> {
+        self.containers
+            .read()
+            .expect("state manager lock poisoned on get_by_name")
+            .values()
+            .find(|s| s.container_name == name)
+            .cloned()
+    }
+
+    fn find_key_by_name(
+        &self,
+        guard: &HashMap<String, ContainerState>,
+        name: &str,
+    ) -> Option<String> {
+        guard
+            .iter()
+            .find(|(_, v)| v.container_name == name)
+            .map(|(k, _)| k.clone())
     }
 
     pub fn start_heartbeat_monitor(&self, cgroup_path: &str, timeout_seconds: u32) {

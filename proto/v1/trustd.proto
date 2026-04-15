@@ -50,6 +50,26 @@ service Trustd {
   // in the container cgroup. A follow-up measurement event should be emitted
   // by the kernel once the container runtime recreates the container.
   rpc RestartContainer(GetContainerStateRequest) returns (ContainerState);
+
+  // ---- Container lifecycle management (kata-agent-like) ----
+  //
+  // These RPCs make trustd the single in-guest authority for container
+  // lifecycle: the host (virt-handler) tells trustd WHAT to run, and
+  // trustd manages the container runtime (Docker/containerd) inside the
+  // CVM. This replaces the earlier cloud-init-based container start path.
+
+  // StartContainer creates and starts a container from an image that is
+  // already present in the guest's container runtime store. trustd stores
+  // the spec so remediation can recreate the container from scratch.
+  rpc StartContainer(StartContainerRequest) returns (StartContainerResponse);
+
+  // StopContainer stops and removes a running container.
+  rpc StopContainer(StopContainerRequest) returns (StopContainerResponse);
+
+  // ListRunningContainers returns containers currently managed by trustd's
+  // lifecycle layer (not all containers on the system — only the ones
+  // started via StartContainer).
+  rpc ListRunningContainers(ListRunningRequest) returns (ListRunningResponse);
 }
 
 // AttestContainerRequest triggers attestation of a specific container.
@@ -117,6 +137,21 @@ message GetContainerStateRequest {
   string cgroup_path = 1;
 }
 
+// ContainerPhase tracks where a lifecycle-managed container is in its
+// state machine. Containers discovered passively by the securityfs
+// watcher (not started via StartContainer) remain at PHASE_UNMANAGED.
+enum ContainerPhase {
+  CONTAINER_PHASE_UNMANAGED = 0;   // legacy: not started via StartContainer
+  CONTAINER_PHASE_PENDING = 1;     // StartContainer received, not yet created
+  CONTAINER_PHASE_RUNNING = 2;     // container process is running, IMA measured
+  CONTAINER_PHASE_READY = 3;       // [TRUSTWEAVE_READY] detected on stdout
+  CONTAINER_PHASE_TRUSTED = 4;     // attestation-service returned TRUSTED
+  CONTAINER_PHASE_UNTRUSTED = 5;   // attestation failed after measurement change
+  CONTAINER_PHASE_REMEDIATING = 6; // stop + remove + recreate in progress
+  CONTAINER_PHASE_STOPPED = 7;     // StopContainer completed
+  CONTAINER_PHASE_FAILED = 8;      // start or remediation failed
+}
+
 // ContainerState represents the current state of a tracked container.
 message ContainerState {
   string cgroup_path = 1;
@@ -126,6 +161,11 @@ message ContainerState {
   int64 last_heartbeat = 5;       // seconds since epoch, 0 if never
   int64 heartbeat_count = 6;
   bool heartbeat_monitoring = 7;
+
+  // Lifecycle fields (populated only for containers started via StartContainer).
+  ContainerPhase phase = 10;
+  string container_name = 11;     // Docker/containerd name (empty for unmanaged)
+  string container_id = 12;       // Docker/containerd ID (empty for unmanaged)
 }
 
 // WatchEventsRequest subscribes to container events.
@@ -137,7 +177,7 @@ message WatchEventsRequest {
   string cgroup_path = 2;
 }
 
-// EventType mirrors the kernel's IMA_CN_EVENT_* constants.
+// EventType mirrors the kernel's IMA_CN_EVENT_* constants plus lifecycle events.
 enum EventType {
   EVENT_TYPE_UNSPECIFIED = 0;
   EVENT_TYPE_NEW = 1;
@@ -147,6 +187,9 @@ enum EventType {
   EVENT_TYPE_REMOVED = 5;
   EVENT_TYPE_ATTEST_BEGIN = 6;
   EVENT_TYPE_ATTEST_END = 7;
+  // Lifecycle events (emitted by the lifecycle manager, not the kernel):
+  EVENT_TYPE_READY = 8;           // [TRUSTWEAVE_READY] detected on container stdout
+  EVENT_TYPE_PHASE_CHANGE = 9;    // container phase transitioned (see ContainerPhase)
 }
 
 // ContainerEvent is streamed to subscribers.
@@ -165,6 +208,10 @@ message ContainerEvent {
   // Current RTMR3 at event time (hex):
   string rtmr3 = 7;
   int64 measurement_count = 8;
+
+  // For PHASE_CHANGE and READY events:
+  ContainerPhase phase = 9;
+  string container_name = 10;
 }
 
 // GetTDQuoteRequest asks trustd to obtain a TD Quote.
@@ -213,3 +260,60 @@ message HeartbeatReportRequest {
 
 // HeartbeatReportResponse confirms heartbeat ingestion.
 message HeartbeatReportResponse {}
+
+// ---- Container lifecycle messages ----
+
+// RemediationMode controls how RestartContainer behaves for lifecycle-
+// managed containers. For unmanaged (legacy) containers, the mode is
+// always SIGNAL regardless of what the caller requests.
+enum RemediationMode {
+  REMEDIATION_MODE_SIGNAL = 0;    // existing: SIGTERM/SIGKILL cgroup PIDs
+  REMEDIATION_MODE_RECREATE = 1;  // stop + remove + create from stored spec
+  REMEDIATION_MODE_KILL = 2;      // stop + remove, no restart
+}
+
+message StartContainerRequest {
+  string name = 1;                    // container name (trustweave-mcp-0, etc.)
+  string image = 2;                   // OCI image ref (must be pre-staged in guest)
+  repeated string env = 3;            // KEY=VALUE pairs
+  repeated int32 ports = 4;           // ports the container listens on (for ready detection)
+  bool network_host = 5;              // --network host
+  map<string, string> labels = 6;     // optional labels
+  string ready_marker = 7;            // substring to match on stdout for READY (default: TRUSTWEAVE_READY)
+}
+
+message StartContainerResponse {
+  string cgroup_path = 1;             // resolved cgroup after start (may be empty if pending)
+  string container_id = 2;            // Docker/containerd container ID
+  bool started = 3;
+  string error = 4;
+  ContainerPhase phase = 5;           // current phase after start attempt
+}
+
+message StopContainerRequest {
+  string name = 1;                    // stop by name
+  string cgroup_path = 2;             // or by cgroup (for remediation path)
+  int32 timeout_seconds = 3;          // grace period before SIGKILL (default: 10)
+}
+
+message StopContainerResponse {
+  bool stopped = 1;
+  string error = 2;
+}
+
+message ListRunningRequest {}
+
+message ListRunningResponse {
+  repeated ManagedContainer containers = 1;
+}
+
+// ManagedContainer is a container started via StartContainer.
+message ManagedContainer {
+  string name = 1;
+  string image = 2;
+  string cgroup_path = 3;
+  string container_id = 4;
+  ContainerPhase phase = 5;
+  int64 started_at = 6;              // unix epoch seconds
+  repeated int32 ports = 7;
+}

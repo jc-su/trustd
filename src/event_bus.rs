@@ -12,10 +12,13 @@ pub enum ContainerEventKind {
     Removed,
     AttestBegin,
     AttestEnd,
+    // Lifecycle events (emitted by the lifecycle manager, not the kernel):
+    Ready,
+    PhaseChange,
 }
 
-/// Runtime event emitted by the watcher and service.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Runtime event emitted by the watcher, service, and lifecycle manager.
+#[derive(Debug, Clone)]
 pub struct ContainerEvent {
     pub kind: ContainerEventKind,
     pub cgroup_path: String,
@@ -25,6 +28,9 @@ pub struct ContainerEvent {
     pub detail: Option<String>,
     pub rtmr3: Option<String>,
     pub measurement_count: Option<i64>,
+    // Lifecycle fields (populated only for Ready / PhaseChange events):
+    pub container_name: Option<String>,
+    pub phase: Option<crate::lifecycle::Phase>,
 }
 
 impl ContainerEvent {
@@ -38,6 +44,8 @@ impl ContainerEvent {
             detail: None,
             rtmr3: None,
             measurement_count: None,
+            container_name: None,
+            phase: None,
         }
     }
 }

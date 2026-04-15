@@ -30,6 +30,9 @@ where
     events: EventBus,
     version: Arc<str>,
     started_at: Instant,
+    // Lifecycle extensions (None = legacy mode, no container management).
+    lifecycle: Option<Arc<crate::lifecycle::LifecycleManager>>,
+    spec_store: Arc<crate::spec_store::SpecStore>,
 }
 
 impl<A, Q> Clone for TrustdService<A, Q>
@@ -46,6 +49,8 @@ where
             events: self.events.clone(),
             version: Arc::clone(&self.version),
             started_at: self.started_at,
+            lifecycle: self.lifecycle.clone(),
+            spec_store: Arc::clone(&self.spec_store),
         }
     }
 }
@@ -71,7 +76,20 @@ where
             events,
             version: version.into(),
             started_at: Instant::now(),
+            lifecycle: None,
+            spec_store: Arc::new(crate::spec_store::SpecStore::new()),
         }
+    }
+
+    /// Inject the lifecycle manager after construction (called from main.rs
+    /// once the DockerRuntime is ready).
+    pub fn set_lifecycle(
+        &mut self,
+        lifecycle: Arc<crate::lifecycle::LifecycleManager>,
+        spec_store: Arc<crate::spec_store::SpecStore>,
+    ) {
+        self.lifecycle = Some(lifecycle);
+        self.spec_store = spec_store;
     }
 
     pub fn event_bus(&self) -> EventBus {
@@ -204,6 +222,10 @@ where
                 last_heartbeat: state.last_heartbeat.map_or(0, unix_seconds),
                 heartbeat_count: state.heartbeat_count,
                 heartbeat_monitoring: state.heartbeat_monitoring,
+                // Lifecycle fields (default: unmanaged).
+                phase: 0,
+                container_name: String::new(),
+                container_id: String::new(),
             })
             .collect();
 
@@ -235,6 +257,10 @@ where
             last_heartbeat: state.last_heartbeat.map_or(0, unix_seconds),
             heartbeat_count: state.heartbeat_count,
             heartbeat_monitoring: state.heartbeat_monitoring,
+                // Lifecycle fields (default: unmanaged).
+                phase: 0,
+                container_name: String::new(),
+                container_id: String::new(),
         }))
     }
 
@@ -430,12 +456,125 @@ where
                 last_heartbeat: state.last_heartbeat.map_or(0, unix_seconds),
                 heartbeat_count: state.heartbeat_count,
                 heartbeat_monitoring: state.heartbeat_monitoring,
+                // Lifecycle fields (default: unmanaged).
+                phase: 0,
+                container_name: String::new(),
+                container_id: String::new(),
             },
             None => proto::ContainerState {
                 cgroup_path: request.cgroup_path,
                 ..proto::ContainerState::default()
             },
         }))
+    }
+
+    // ---- Container lifecycle RPCs ----
+
+    async fn start_container(
+        &self,
+        request: Request<proto::StartContainerRequest>,
+    ) -> Result<Response<proto::StartContainerResponse>, Status> {
+        let lm = self.lifecycle.as_ref()
+            .ok_or_else(|| Status::unavailable("lifecycle manager not initialized (Docker may not be available in this guest)"))?;
+
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        if req.image.is_empty() {
+            return Err(Status::invalid_argument("image is required"));
+        }
+
+        let req_name = req.name.clone();
+        let spec = crate::runtime::ContainerSpec {
+            name: req.name,
+            image: req.image,
+            env: req.env,
+            ports: req.ports,
+            network_host: req.network_host,
+            labels: req.labels,
+            ready_marker: if req.ready_marker.is_empty() {
+                "TRUSTWEAVE_READY".into()
+            } else {
+                req.ready_marker
+            },
+        };
+
+        match lm.start_container(spec).await {
+            Ok(result) => {
+                let phase_state = self.state.get_by_name(&req_name);
+                Ok(Response::new(proto::StartContainerResponse {
+                    cgroup_path: result.cgroup_path,
+                    container_id: result.container_id,
+                    started: true,
+                    error: String::new(),
+                    phase: phase_state.map_or(0, |s| s.phase.to_proto()),
+                }))
+            }
+            Err(e) => Ok(Response::new(proto::StartContainerResponse {
+                cgroup_path: String::new(),
+                container_id: String::new(),
+                started: false,
+                error: e.to_string(),
+                phase: crate::lifecycle::Phase::Failed.to_proto(),
+            })),
+        }
+    }
+
+    async fn stop_container(
+        &self,
+        request: Request<proto::StopContainerRequest>,
+    ) -> Result<Response<proto::StopContainerResponse>, Status> {
+        let lm = self.lifecycle.as_ref()
+            .ok_or_else(|| Status::unavailable("lifecycle manager not initialized"))?;
+
+        let req = request.into_inner();
+        let name = if !req.name.is_empty() {
+            req.name
+        } else if !req.cgroup_path.is_empty() {
+            self.spec_store
+                .name_for_cgroup(&req.cgroup_path)
+                .ok_or_else(|| Status::not_found("no lifecycle-managed container at that cgroup"))?
+        } else {
+            return Err(Status::invalid_argument("name or cgroup_path is required"));
+        };
+
+        let timeout = if req.timeout_seconds > 0 {
+            req.timeout_seconds as u32
+        } else {
+            10
+        };
+
+        match lm.stop_container(&name, timeout).await {
+            Ok(()) => Ok(Response::new(proto::StopContainerResponse {
+                stopped: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(proto::StopContainerResponse {
+                stopped: false,
+                error: e.to_string(),
+            })),
+        }
+    }
+
+    async fn list_running_containers(
+        &self,
+        _request: Request<proto::ListRunningRequest>,
+    ) -> Result<Response<proto::ListRunningResponse>, Status> {
+        let containers = self.spec_store.all().into_iter().map(|(spec, cgroup)| {
+            let phase_state = self.state.get_by_name(&spec.name);
+            proto::ManagedContainer {
+                name: spec.name,
+                image: spec.image,
+                cgroup_path: cgroup,
+                container_id: String::new(),
+                phase: phase_state.map_or(0, |s| s.phase.to_proto()),
+                started_at: 0,
+                ports: spec.ports,
+            }
+        }).collect();
+
+        Ok(Response::new(proto::ListRunningResponse { containers }))
     }
 }
 
@@ -490,6 +629,12 @@ fn to_proto_event(event: ContainerEvent) -> proto::ContainerEvent {
         detail: event.detail.unwrap_or_default(),
         rtmr3: event.rtmr3.unwrap_or_default(),
         measurement_count: event.measurement_count.unwrap_or_default(),
+        // Lifecycle fields:
+        phase: event
+            .phase
+            .map(|p| p.to_proto())
+            .unwrap_or(0),
+        container_name: event.container_name.unwrap_or_default(),
     }
 }
 
@@ -502,6 +647,8 @@ fn map_event_kind(kind: ContainerEventKind) -> proto::EventType {
         ContainerEventKind::Removed => proto::EventType::Removed,
         ContainerEventKind::AttestBegin => proto::EventType::AttestBegin,
         ContainerEventKind::AttestEnd => proto::EventType::AttestEnd,
+        ContainerEventKind::Ready => proto::EventType::Ready,
+        ContainerEventKind::PhaseChange => proto::EventType::PhaseChange,
     }
 }
 
