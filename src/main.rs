@@ -14,11 +14,14 @@ use tracing::{info, warn};
 
 use trustd::config::Config;
 use trustd::event_bus::EventBus;
+use trustd::lifecycle::LifecycleManager;
 use trustd::liveness::{CgroupProcessProbe, SelfHeartbeatReporter};
 use trustd::proto;
 use trustd::remediation::CgroupProcessRestarter;
+use trustd::runtime::DockerRuntime;
 use trustd::securityfs::{Attestor, KernelSecurityFsAttestor, KernelSecurityFsReader};
 use trustd::service::TrustdService;
+use trustd::spec_store::SpecStore;
 use trustd::state::StateManager;
 use trustd::tdquote::{QuoteProvider, TsmQuoter};
 use trustd::unix_rpc;
@@ -41,7 +44,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let quoter = Arc::new(TsmQuoter::new(config.tsm_path.clone()));
     let restarter = Arc::new(CgroupProcessRestarter::default());
 
-    let service = TrustdService::new(
+    let mut service = TrustdService::new(
         attestor,
         quoter,
         restarter,
@@ -49,6 +52,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
         events.clone(),
         env!("CARGO_PKG_VERSION"),
     );
+
+    // Wire up the container lifecycle manager. Without this the
+    // StartContainer / StopContainer RPCs return UNAVAILABLE with
+    // "lifecycle manager not initialized", and every call from
+    // virt-handler fails. DockerRuntime::new() opens a bollard client
+    // against /var/run/docker.sock — if Docker isn't running (or the
+    // socket isn't there yet), we surface a warning and keep the
+    // attestation/measurement path alive, but RPCs will still fail
+    // until an operator restarts trustd.
+    match DockerRuntime::new() {
+        Ok(runtime) => {
+            let spec_store = Arc::new(SpecStore::new());
+            let state_for_phase = Arc::clone(&state);
+            let lifecycle = Arc::new(LifecycleManager::new(
+                Arc::new(runtime),
+                Arc::clone(&spec_store),
+                Arc::new(events.clone()),
+                Box::new(move |name, phase, cgroup| {
+                    state_for_phase.set_phase(name, phase, cgroup);
+                }),
+            ));
+            service.set_lifecycle(lifecycle, spec_store);
+            info!("lifecycle manager initialized (bollard → /var/run/docker.sock)");
+        }
+        Err(e) => {
+            warn!(error = %e, "DockerRuntime init failed — StartContainer/StopContainer RPCs will be Unavailable");
+        }
+    }
 
     let cancel = CancellationToken::new();
     let watcher = MeasurementWatcher::new(

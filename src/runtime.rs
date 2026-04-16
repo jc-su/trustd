@@ -86,10 +86,29 @@ pub struct DockerRuntime {
 }
 
 impl DockerRuntime {
+    /// Connect to the local Docker daemon. Retries briefly on failure so a
+    /// race between `docker.service` reaching READY=1 and `trustd` starting
+    /// — or Docker being momentarily unreachable after restart — doesn't
+    /// leave trustd with a dead bollard client. Happy path is ~0ms; worst
+    /// case is ~600ms (3 × 200ms) before we give up.
     pub fn new() -> Result<Self, RuntimeError> {
-        let client = Docker::connect_with_socket_defaults()
-            .map_err(|e| RuntimeError::Connect(e.to_string()))?;
-        Ok(Self { client })
+        const MAX_ATTEMPTS: u32 = 3;
+        const BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+        let mut last_err: Option<String> = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match Docker::connect_with_socket_defaults() {
+                Ok(client) => return Ok(Self { client }),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if attempt < MAX_ATTEMPTS {
+                        warn!(attempt, error = %msg, "bollard connect failed; retrying");
+                        std::thread::sleep(BACKOFF);
+                    }
+                    last_err = Some(msg);
+                }
+            }
+        }
+        Err(RuntimeError::Connect(last_err.unwrap_or_default()))
     }
 
     /// Resolve the cgroup path for a running container.
@@ -124,6 +143,29 @@ impl ContainerRuntime for DockerRuntime {
     async fn create_and_start(&self, spec: &ContainerSpec) -> Result<StartResult, RuntimeError> {
         // Remove any stale container with the same name (idempotent).
         let _ = self.stop_and_remove(&spec.name, 5).await;
+
+        // Make sure the image is present. bollard's create_container does NOT
+        // auto-pull (unlike `docker run`), so we do it explicitly — but ONLY
+        // when the image isn't already cached. For pre-baked / locally-built
+        // images (e.g. images baked into the qcow2 via `docker load` during
+        // image build) this avoids a Docker Hub round-trip that would 404 on
+        // private-name-only tags like `trustweave/sqlite-ready:latest`.
+        if self.client.inspect_image(&spec.image).await.is_err() {
+            use bollard::image::CreateImageOptions;
+            let opts = CreateImageOptions {
+                from_image: spec.image.clone(),
+                ..Default::default()
+            };
+            let mut stream = self.client.create_image(Some(opts), None, None);
+            while let Some(event) = stream.next().await {
+                if let Err(e) = event {
+                    return Err(RuntimeError::Create(format!(
+                        "pull {}: {}",
+                        spec.image, e
+                    )));
+                }
+            }
+        }
 
         let host_config = HostConfig {
             network_mode: if spec.network_host {
