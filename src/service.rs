@@ -7,15 +7,104 @@ use async_stream::try_stream;
 use base64::Engine;
 use futures_core::Stream;
 use tonic::{Request, Response, Status};
-use tracing::warn;
 
 use crate::error::AgentError;
 use crate::event_bus::{ContainerEvent, ContainerEventKind, EventBus};
 use crate::proto;
 use crate::remediation::ContainerRestarter;
 use crate::securityfs::Attestor;
+use crate::spec_store::SpecStore;
 use crate::state::StateManager;
 use crate::tdquote::QuoteProvider;
+
+/// Build an AttestWorkloadResponse bundle for the given workload.
+///
+/// Shared between the gRPC `attest_workload` handler and the Unix-socket
+/// JSON RPC path so both ingress surfaces produce byte-identical evidence
+/// bundles. Kept out of the service impl so it can be called without a
+/// tonic Request wrapper.
+pub fn build_attest_bundle<Q: QuoteProvider + ?Sized>(
+    spec_store: &SpecStore,
+    quoter: &Q,
+    workload_id: &str,
+    nonce_hex: &str,
+    peer_pk: &[u8],
+) -> Result<proto::AttestWorkloadResponse, Status> {
+    use sha2::{Digest, Sha384};
+
+    if workload_id.is_empty() {
+        return Err(Status::invalid_argument("workload_id is required"));
+    }
+    if nonce_hex.is_empty() {
+        return Err(Status::invalid_argument("nonce_hex is required"));
+    }
+    let nonce_bytes = hex::decode(nonce_hex)
+        .map_err(|_| Status::invalid_argument("nonce_hex must be valid hex"))?;
+
+    // workload_id → current cgroup via the spec store. Reject unknown
+    // workloads fail-closed (trustd never produces evidence for
+    // workloads it didn't start).
+    if spec_store.get_by_name(workload_id).is_none() {
+        return Err(Status::not_found(format!(
+            "workload_id '{}' not registered with trustd",
+            workload_id
+        )));
+    }
+    let cgroup = spec_store.cgroup_for_name(workload_id).ok_or_else(|| {
+        Status::failed_precondition(
+            "workload has no associated cgroup yet (container may not have started)",
+        )
+    })?;
+
+    // Read the kernel's per-container JSON log. Filename: strip leading
+    // slash and replace internal slashes with underscores; see
+    // DEVELOPER_GUIDE_CONTAINER_RTMR3.md and ima_container.c.
+    let mangled = cgroup.trim_start_matches('/').replace('/', "_");
+    let log_path =
+        std::path::Path::new("/sys/kernel/security/ima/container_rtmr").join(&mangled);
+    let event_log = std::fs::read(&log_path).map_err(|e| {
+        Status::internal(format!(
+            "failed to read per-container event log at {}: {}",
+            log_path.display(),
+            e
+        ))
+    })?;
+
+    // report_data binds the quote to (nonce, peer_pk). 64 bytes:
+    //   first  32 = SHA384(nonce)[..32]
+    //   second 32 = SHA384(peer_pk)[..32] if peer_pk present, else 0s
+    let mut report_data = [0_u8; 64];
+    let nonce_hash = Sha384::digest(&nonce_bytes);
+    report_data[..32].copy_from_slice(&nonce_hash[..32]);
+    if !peer_pk.is_empty() {
+        let pk_hash = Sha384::digest(peer_pk);
+        report_data[32..].copy_from_slice(&pk_hash[..32]);
+    }
+
+    if !quoter.available() {
+        return Err(Status::unavailable(
+            "TDX quote provider is not available on this host",
+        ));
+    }
+    let td_quote = quoter
+        .get_quote(&report_data)
+        .map_err(|e| Status::internal(format!("TDX_CMD_GET_QUOTE failed: {}", e)))?;
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    Ok(proto::AttestWorkloadResponse {
+        workload_id: workload_id.to_owned(),
+        cgroup_path: cgroup,
+        nonce_hex: nonce_hex.to_owned(),
+        td_quote,
+        event_log,
+        report_data_hex: hex::encode(report_data),
+        timestamp,
+    })
+}
 
 #[derive(Debug)]
 pub struct TrustdService<A, Q>
@@ -108,6 +197,10 @@ where
         &self.quoter
     }
 
+    pub fn spec_store(&self) -> Arc<crate::spec_store::SpecStore> {
+        Arc::clone(&self.spec_store)
+    }
+
     pub fn restarter(&self) -> &Arc<dyn ContainerRestarter> {
         &self.restarter
     }
@@ -137,73 +230,29 @@ where
     A: Attestor + 'static,
     Q: QuoteProvider + 'static,
 {
-    async fn attest_container(
+    /// Canonical attestation RPC for a workload identified by its stable
+    /// name. Bundles:
+    ///   - TD quote with report_data = SHA384(nonce) || SHA384(peer_pk)
+    ///   - Kernel's per-container event log (single JSON object)
+    ///   - workload_id + cgroup (audit)
+    ///
+    /// Does no measurement interpretation — the verifier receives the raw
+    /// event log and replays it against its reference values. This matches
+    /// the current kernel design where HW RTMR[3] is a shared interleaved
+    /// chain and per-container replay against it is not possible.
+    async fn attest_workload(
         &self,
-        request: Request<proto::AttestContainerRequest>,
-    ) -> Result<Response<proto::AttestContainerResponse>, Status> {
+        request: Request<proto::AttestWorkloadRequest>,
+    ) -> Result<Response<proto::AttestWorkloadResponse>, Status> {
         let request = request.into_inner();
-
-        if request.cgroup_path.is_empty() {
-            return Err(Status::invalid_argument("cgroup_path is required"));
-        }
-        if request.nonce_hex.is_empty() {
-            return Err(Status::invalid_argument("nonce_hex is required"));
-        }
-        if hex::decode(&request.nonce_hex).is_err() {
-            return Err(Status::invalid_argument("nonce_hex must be valid hex"));
-        }
-
-        self.publish_event(ContainerEvent::new(
-            ContainerEventKind::AttestBegin,
-            request.cgroup_path.clone(),
-        ));
-
-        let kernel = self
-            .attestor
-            .attest(&request.cgroup_path, &request.nonce_hex)
-            .map_err(|error| Self::status_for_error(error, "attestation failed"))?;
-
-        let mut response = proto::AttestContainerResponse {
-            cgroup_path: kernel.cgroup_path.clone(),
-            rtmr3: kernel.rtmr3.clone(),
-            initial_rtmr3: kernel.initial_rtmr3,
-            measurement_count: kernel.count,
-            measurements: kernel
-                .measurements
-                .into_iter()
-                .map(|measurement| proto::ContainerMeasurement {
-                    digest: measurement.digest,
-                    file: measurement.file,
-                })
-                .collect(),
-            report_data: kernel.report_data.clone(),
-            nonce: kernel.nonce,
-            td_quote: Vec::new(),
-            timestamp: kernel.timestamp,
-        };
-
-        if request.include_td_quote && self.quoter.available() {
-            match hex::decode(&kernel.report_data) {
-                Ok(report_data) => {
-                    let mut padded = [0_u8; 64];
-                    let copy_len = report_data.len().min(64);
-                    padded[..copy_len].copy_from_slice(&report_data[..copy_len]);
-
-                    match self.quoter.get_quote(&padded) {
-                        Ok(quote) => response.td_quote = quote,
-                        Err(error) => warn!(error = %error, "unable to produce TD quote"),
-                    }
-                }
-                Err(error) => warn!(error = %error, "report_data is not valid hex; skipping quote"),
-            }
-        }
-
-        self.publish_event(ContainerEvent::new(
-            ContainerEventKind::AttestEnd,
-            request.cgroup_path,
-        ));
-
-        Ok(Response::new(response))
+        let bundle = build_attest_bundle(
+            self.spec_store.as_ref(),
+            self.quoter.as_ref(),
+            &request.workload_id,
+            &request.nonce_hex,
+            &request.peer_pk,
+        )?;
+        Ok(Response::new(bundle))
     }
 
     async fn list_containers(
@@ -730,67 +779,6 @@ mod tests {
                 force_killed_pids: 0,
             })
         }
-    }
-
-    #[tokio::test]
-    async fn attest_rejects_invalid_nonce_hex() {
-        let service = TrustdService::new(
-            Arc::new(FakeAttestor),
-            Arc::new(FakeQuoter::default()),
-            Arc::new(FakeRestarter::default()),
-            Arc::new(StateManager::new()),
-            EventBus::new(8),
-            "test",
-        );
-
-        let err = service
-            .attest_container(Request::new(proto::AttestContainerRequest {
-                cgroup_path: "cg1".to_owned(),
-                nonce_hex: "not-hex".to_owned(),
-                include_td_quote: false,
-            }))
-            .await
-            .expect_err("invalid nonce should fail");
-
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    }
-
-    #[tokio::test]
-    async fn attest_can_include_quote() {
-        let quoter = Arc::new(FakeQuoter {
-            available: true,
-            ..FakeQuoter::default()
-        });
-        let service = TrustdService::new(
-            Arc::new(FakeAttestor),
-            Arc::clone(&quoter),
-            Arc::new(FakeRestarter::default()),
-            Arc::new(StateManager::new()),
-            EventBus::new(8),
-            "test",
-        );
-
-        let response = service
-            .attest_container(Request::new(proto::AttestContainerRequest {
-                cgroup_path: "cg1".to_owned(),
-                nonce_hex: "ab".repeat(32),
-                include_td_quote: true,
-            }))
-            .await
-            .expect("attestation should succeed")
-            .into_inner();
-
-        assert_eq!(response.td_quote, vec![9, 9, 9]);
-        assert_eq!(
-            quoter
-                .last_request
-                .lock()
-                .expect("quoter lock should not be poisoned")
-                .as_ref()
-                .expect("report data should be captured")
-                .len(),
-            64
-        );
     }
 
     #[tokio::test]

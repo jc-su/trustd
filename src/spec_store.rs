@@ -70,6 +70,21 @@ impl SpecStore {
             .map(|s| s.spec.name.clone())
     }
 
+    /// Look up the current cgroup path for a stable workload name.
+    /// Returns None if the workload isn't registered or hasn't been
+    /// assigned a cgroup yet (e.g., before the first StartContainer
+    /// completed). Canonical accessor for AttestWorkload: trustd keeps
+    /// the workload_id stable across restarts while the cgroup path
+    /// rotates each time Docker assigns a new container ID.
+    pub fn cgroup_for_name(&self, name: &str) -> Option<String> {
+        self.by_name
+            .read()
+            .unwrap()
+            .get(name)
+            .map(|s| s.cgroup_path.clone())
+            .filter(|p| !p.is_empty())
+    }
+
     /// Update the cgroup path after a container is recreated (the new
     /// container gets a different cgroup than the old one).
     pub fn update_cgroup(&self, name: &str, new_cgroup: &str, new_id: &str) {

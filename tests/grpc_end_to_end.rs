@@ -98,7 +98,7 @@ async fn spawn_server(
 }
 
 #[tokio::test]
-async fn ping_and_attest_over_grpc() {
+async fn ping_over_grpc() {
     let state = Arc::new(StateManager::new());
     state.update_from_securityfs("cg1", "rtmr", "initial", 2);
 
@@ -120,21 +120,6 @@ async fn ping_and_attest_over_grpc() {
         .into_inner();
     assert_eq!(ping.version, "test-version");
     assert_eq!(ping.containers_tracked, 1);
-
-    let attest = client
-        .attest_container(proto::AttestContainerRequest {
-            cgroup_path: "cg1".to_owned(),
-            nonce_hex: "ab".repeat(32),
-            include_td_quote: true,
-        })
-        .await
-        .expect("attestation should succeed")
-        .into_inner();
-
-    assert_eq!(attest.cgroup_path, "cg1");
-    assert_eq!(attest.measurement_count, 2);
-    assert_eq!(attest.measurements.len(), 1);
-    assert_eq!(attest.td_quote, vec![1, 2, 3, 4]);
 
     let _ = shutdown_tx.send(());
 }

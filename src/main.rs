@@ -13,8 +13,8 @@ use tonic::transport::Server;
 use tracing::{info, warn};
 
 use trustd::config::Config;
-use trustd::event_bus::EventBus;
-use trustd::lifecycle::LifecycleManager;
+use trustd::event_bus::{ContainerEvent, ContainerEventKind, EventBus};
+use trustd::lifecycle::{LifecycleManager, Phase};
 use trustd::liveness::{CgroupProcessProbe, SelfHeartbeatReporter};
 use trustd::proto;
 use trustd::remediation::CgroupProcessRestarter;
@@ -82,13 +82,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let cancel = CancellationToken::new();
-    let watcher = MeasurementWatcher::new(
-        reader,
-        Arc::clone(&state),
-        events.clone(),
-        config.poll_timeout_ms,
-    );
-    let watcher_handle = tokio::spawn(watcher.run(cancel.clone()));
+    // Watcher spawn is gated on MeasurementMode. `Off` leaves it unspawned so
+    // trustd only runs the lifecycle surface (StartContainer/StopContainer +
+    // attestation RPCs on demand). That's the "lifecycle-only" mode used by
+    // cold-start / runtime-QPS benchmarks to isolate the cost of measurement
+    // and remediation from the cost of the container lifecycle itself.
+    let (watcher_handle, drift_detector_handle) = if config.measurement_mode.watcher_enabled() {
+        info!(
+            mode = ?config.measurement_mode,
+            "measurement watcher enabled"
+        );
+        let watcher = MeasurementWatcher::new(
+            reader,
+            Arc::clone(&state),
+            events.clone(),
+            config.poll_timeout_ms,
+        );
+        let watcher_h = tokio::spawn(watcher.run(cancel.clone()));
+        let drift_h = tokio::spawn(run_drift_detector(
+            events.clone(),
+            Arc::clone(&state),
+            cancel.clone(),
+        ));
+        (Some(watcher_h), Some(drift_h))
+    } else {
+        info!("measurement watcher disabled (measurement_mode=Off)");
+        (None, None)
+    };
     let self_heartbeat_handle = if config.self_heartbeat_enabled {
         let interval = Duration::from_secs(config.self_heartbeat_interval_seconds.max(1));
         info!(
@@ -128,13 +148,78 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     cancel.cancel();
-    watcher_handle.await.map_err(Box::<dyn Error>::from)?;
+    if let Some(handle) = watcher_handle {
+        handle.await.map_err(Box::<dyn Error>::from)?;
+    }
+    if let Some(handle) = drift_detector_handle {
+        handle.await.map_err(Box::<dyn Error>::from)?;
+    }
     if let Some(handle) = self_heartbeat_handle {
         handle.await.map_err(Box::<dyn Error>::from)?;
     }
     unix_handle.await.map_err(Box::<dyn Error>::from)?;
 
     Ok(())
+}
+
+/// Promotes `Trusted → Untrusted` when the watcher reports a post-attest
+/// measurement delta. This is the "event log drifted while we thought the
+/// workload was trusted" signal — it does not itself remediate; it flips
+/// Phase and republishes a `PhaseChange` event so virt-handler's
+/// `SubscribeEvents` stream sees it and runs policy (Alert / Restart / Kill).
+///
+/// Only Measurement events count as drift. HeartbeatMiss is a separate
+/// liveness signal with different semantics.
+async fn run_drift_detector(
+    events: EventBus,
+    state: Arc<trustd::state::StateManager>,
+    cancel: CancellationToken,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    let mut rx = events.subscribe();
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            recv = rx.recv() => match recv {
+                Err(RecvError::Closed) => return,
+                Err(RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "drift detector lagged on event bus");
+                    continue;
+                }
+                Ok(event) => {
+                    if event.kind != ContainerEventKind::Measurement {
+                        continue;
+                    }
+                    let Some(prev) = state.get(&event.cgroup_path) else { continue };
+                    if prev.phase != Phase::Trusted {
+                        continue;
+                    }
+                    if prev.container_name.is_empty() {
+                        warn!(
+                            cgroup = %event.cgroup_path,
+                            "drift on unmanaged container; cannot transition phase"
+                        );
+                        continue;
+                    }
+                    state.set_phase(&prev.container_name, Phase::Untrusted, &event.cgroup_path);
+                    let mut out = ContainerEvent::new(
+                        ContainerEventKind::PhaseChange,
+                        event.cgroup_path.clone(),
+                    );
+                    out.container_name = Some(prev.container_name.clone());
+                    out.phase = Some(Phase::Untrusted);
+                    out.detail = event.detail.clone();
+                    events.publish(out);
+                    info!(
+                        container = %prev.container_name,
+                        cgroup = %event.cgroup_path,
+                        count = ?event.measurement_count,
+                        "phase Trusted → Untrusted (measurement drift)"
+                    );
+                }
+            }
+        }
+    }
 }
 
 async fn serve_unix<A, Q>(
@@ -176,6 +261,7 @@ async fn serve_unix<A, Q>(
     let state = service.state_manager();
     let quoter = Arc::clone(service.quoter());
     let restarter = Arc::clone(service.restarter());
+    let spec_store = service.spec_store();
     let version = Arc::from(service.version_str());
     let started_at = service.started_at();
 
@@ -187,9 +273,10 @@ async fn serve_unix<A, Q>(
                         let state = Arc::clone(&state);
                         let quoter = Arc::clone(&quoter);
                         let restarter = Arc::clone(&restarter);
+                        let spec_store = Arc::clone(&spec_store);
                         let version = Arc::clone(&version);
                         tokio::spawn(unix_rpc::handle_connection(
-                            stream, state, quoter, restarter, version, started_at,
+                            stream, state, quoter, restarter, spec_store, version, started_at,
                         ));
                     }
                     Err(e) => {

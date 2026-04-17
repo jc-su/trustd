@@ -1,9 +1,40 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use crate::securityfs::{DEFAULT_ATTEST_PATH, DEFAULT_RTMR_PATH};
 use crate::tdquote::DEFAULT_TSM_BASE_PATH;
+
+/// Controls how aggressively trustd drives the measurement + remediation
+/// loop. Orthogonal to the AttestWorkload RPC,
+/// which always work regardless of mode.
+///
+/// Canonical use:
+///   - `Off`: experiments and cost-of-lifecycle benchmarks. trustd only
+///     runs the container lifecycle (StartContainer/StopContainer) and
+///     responds to attestation RPCs when asked. No self-driven watcher,
+///     no remediation. Matches the "non-attested lifecycle" baseline.
+///   - `Observe`: watcher is active and publishes measurement events to
+///     the EventBus for external subscribers (e.g., the host-side
+///     verifier's watcher can pull this). Remediation actions are
+///     suppressed so benchmarks do not kill containers mid-run.
+///   - `Enforce`: full pipeline — watcher + remediation policy in effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MeasurementMode {
+    Off,
+    Observe,
+    Enforce,
+}
+
+impl MeasurementMode {
+    pub fn watcher_enabled(self) -> bool {
+        !matches!(self, MeasurementMode::Off)
+    }
+
+    pub fn remediation_enabled(self) -> bool {
+        matches!(self, MeasurementMode::Enforce)
+    }
+}
 
 pub const DEFAULT_VSOCK_PORT: u32 = 1235;
 pub const DEFAULT_POLL_TIMEOUT_MS: i32 = 30_000;
@@ -58,4 +89,12 @@ pub struct Config {
     /// Host cgroup filesystem root used by internal liveness probing.
     #[arg(long, default_value = DEFAULT_CGROUP_ROOT_PATH)]
     pub cgroup_root_path: PathBuf,
+
+    /// How aggressively trustd drives the measurement + remediation loop.
+    /// See [`MeasurementMode`] for semantics. Defaults to Enforce (full
+    /// production pipeline). Use `off` for lifecycle-only benchmarks and
+    /// `observe` when you want measurements emitted without remediation
+    /// side-effects killing a running experiment.
+    #[arg(long, value_enum, default_value_t = MeasurementMode::Enforce)]
+    pub measurement_mode: MeasurementMode,
 }

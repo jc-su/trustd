@@ -15,10 +15,6 @@ option go_package = "github.com/trustfncall/trustd/proto/v1;trustdv1";
 // virt-handler on the host connects to this service to collect attestation
 // evidence from containers running inside the CVM.
 service Trustd {
-  // AttestContainer performs atomic attestation of a single container.
-  // Returns RTMR3, measurement log, and optional TD Quote.
-  rpc AttestContainer(AttestContainerRequest) returns (AttestContainerResponse);
-
   // ListContainers returns all tracked containers and their current state.
   rpc ListContainers(ListContainersRequest) returns (ListContainersResponse);
 
@@ -70,58 +66,90 @@ service Trustd {
   // lifecycle layer (not all containers on the system — only the ones
   // started via StartContainer).
   rpc ListRunningContainers(ListRunningRequest) returns (ListRunningResponse);
+
+  // AttestWorkload produces evidence for a workload identified by its
+  // stable name (workload_id), independent of the transient cgroup path.
+  // This is the canonical attestation RPC matching the current kernel
+  // design, where:
+  //
+  //   - HW RTMR[3] is a shared interleaved chain across all containers
+  //     in the CVM — per-container replay against RTMR[3] is not possible
+  //     by construction.
+  //   - The authoritative per-container evidence is the event log the
+  //     kernel publishes at
+  //     /sys/kernel/security/ima/container_rtmr/<mangled-cgroup>.
+  //   - The kernel is proven genuine via RTMR[2] in the TD Quote, which
+  //     makes the event log it publishes trustworthy input to a verifier.
+  //
+  // AttestWorkload takes the stable workload_id and dereferences to the
+  // current cgroup via the SpecStore. This keeps the attestation subject
+  // stable across container restarts (which change the cgroup but not the
+  // workload).
+  rpc AttestWorkload(AttestWorkloadRequest) returns (AttestWorkloadResponse);
 }
 
-// AttestContainerRequest triggers attestation of a specific container.
-message AttestContainerRequest {
-  // Container identifier (cgroup path inside the CVM).
-  string cgroup_path = 1;
+// AttestWorkloadRequest triggers attestation for a workload identified
+// by its stable workload_id (= the container name registered at
+// StartContainer time). trustd looks up the current cgroup via the spec
+// store, reads the kernel's per-container event log, and bundles it
+// with a TD quote whose report_data binds the supplied nonce and
+// optional peer public key (for key-bound channel attestation).
+message AttestWorkloadRequest {
+  // Stable workload identity. Must match a container previously started
+  // via StartContainer. trustd will NOT produce evidence for an unknown
+  // workload_id (fail-closed).
+  string workload_id = 1;
 
-  // Nonce from the verifier (hex-encoded). Binds attestation to challenge.
+  // Verifier-chosen nonce (hex-encoded). Will be hashed into report_data
+  // to prevent quote replay.
   string nonce_hex = 2;
 
-  // Whether to include a TD Quote in the response.
-  bool include_td_quote = 3;
+  // Optional: peer public key (raw bytes). When present, report_data is
+  // bound to this key as well, giving the evidence channel-binding
+  // semantics (the quote proves not just liveness but also "this evidence
+  // belongs to a peer that holds the private key for pk"). Empty bytes
+  // disable the binding (e.g., for a one-way attestation that just
+  // reports identity without opening a session).
+  bytes peer_pk = 3;
 }
 
-// AttestContainerResponse contains the attestation evidence for one container.
-message AttestContainerResponse {
-  // Container cgroup path.
-  string cgroup_path = 1;
+// AttestWorkloadResponse bundles the evidence the verifier needs to
+// decide whether to trust this workload. The verifier:
+//   1. Verifies td_quote signature (e.g., via Intel DCAP).
+//   2. Checks td_quote's RTMR[2] against a known-good kernel reference
+//      value — this is what makes event_log_bytes trustworthy.
+//   3. Checks td_quote.report_data == SHA384(nonce) || SHA384(peer_pk)
+//      (or SHA384(nonce) || 0s if no peer_pk was supplied).
+//   4. Replays event_log_bytes against the reference measurement set
+//      for workload_id.
+message AttestWorkloadResponse {
+  // Echo of the workload identity this evidence is for.
+  string workload_id = 1;
 
-  // Current RTMR3 value (hex-encoded, 96 chars for SHA-384).
-  string rtmr3 = 2;
-
-  // Initial RTMR3 value at container creation (hex-encoded).
-  string initial_rtmr3 = 3;
-
-  // Number of measurements extended into RTMR3.
-  int64 measurement_count = 4;
-
-  // Individual measurement log entries.
-  repeated ContainerMeasurement measurements = 5;
-
-  // Reportdata = SHA384(nonce || rtmr3), hex-encoded.
-  string report_data = 6;
+  // Current cgroup path the workload resides in (for audit/trace only;
+  // not used for trust decisions).
+  string cgroup_path = 2;
 
   // Nonce echo (hex-encoded).
-  string nonce = 7;
+  string nonce_hex = 3;
 
-  // Optional: TDX TD Quote (binary, base64-encoded).
-  // Only present if include_td_quote was true in the request.
-  bytes td_quote = 8;
+  // TDX TD Quote (raw bytes). Signed by Intel DCAP; contains RTMR[0..3]
+  // and report_data.
+  bytes td_quote = 4;
+
+  // Per-container event log bytes as published by the kernel at
+  // /sys/kernel/security/ima/container_rtmr/<mangled-cgroup>.
+  // Currently JSONL (one record per line). Verifier replays this
+  // against its reference baseline for workload_id.
+  bytes event_log = 5;
+
+  // report_data that was used in TDX_GET_QUOTE:
+  //   report_data = SHA384(nonce) || (SHA384(peer_pk) if present else 0s)
+  // 64 bytes total, hex-encoded (128 chars).
+  string report_data_hex = 6;
 
   // Timestamp of the attestation (seconds since epoch).
-  int64 timestamp = 9;
-}
-
-// ContainerMeasurement represents a single file measurement.
-message ContainerMeasurement {
-  // SHA-384 digest of the measured file (hex-encoded).
-  string digest = 1;
-
-  // Path of the measured file.
-  string file = 2;
+  int64 timestamp = 7;
 }
 
 // ListContainersRequest lists all tracked containers.

@@ -8,6 +8,10 @@
 //! - `GetTDQuote` — generates a TDX quote via TSM configfs
 //! - `Ping` — returns version, uptime, and container count
 //! - `RestartContainer` — restart a container via cgroup SIGTERM/SIGKILL
+//! - `AttestWorkload` — produces an AttestWorkloadResponse bundle (quote +
+//!   per-container event log + report_data) for a stable workload_id. This
+//!   is the canonical attestation call used by in-guest relying parties
+//!   (e.g. the MCP fork) that cannot read securityfs directly.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,6 +23,8 @@ use tokio::net::UnixStream;
 use tracing::{debug, warn};
 
 use crate::remediation::ContainerRestarter;
+use crate::service::build_attest_bundle;
+use crate::spec_store::SpecStore;
 use crate::state::StateManager;
 use crate::tdquote::QuoteProvider;
 
@@ -61,6 +67,7 @@ pub async fn handle_connection<Q: QuoteProvider>(
     state: Arc<StateManager>,
     quoter: Arc<Q>,
     restarter: Arc<dyn ContainerRestarter>,
+    spec_store: Arc<SpecStore>,
     version: Arc<str>,
     started_at: Instant,
 ) {
@@ -74,6 +81,7 @@ pub async fn handle_connection<Q: QuoteProvider>(
                 &state,
                 quoter.as_ref(),
                 restarter.as_ref(),
+                spec_store.as_ref(),
                 &version,
                 started_at,
             ),
@@ -102,6 +110,7 @@ fn dispatch<Q: QuoteProvider>(
     state: &StateManager,
     quoter: &Q,
     restarter: &dyn ContainerRestarter,
+    spec_store: &SpecStore,
     version: &str,
     started_at: Instant,
 ) -> JsonRpcResponse {
@@ -109,9 +118,57 @@ fn dispatch<Q: QuoteProvider>(
         "GetContainerState" => handle_get_container_state(request, state),
         "GetTDQuote" => handle_get_td_quote(request, quoter),
         "RestartContainer" => handle_restart_container(request, restarter),
+        "AttestWorkload" => handle_attest_workload(request, spec_store, quoter),
         "Ping" => handle_ping(state, version, started_at),
         other => JsonRpcResponse::error(format!("unknown method: {other}")),
     }
+}
+
+fn handle_attest_workload<Q: QuoteProvider>(
+    request: &JsonRpcRequest,
+    spec_store: &SpecStore,
+    quoter: &Q,
+) -> JsonRpcResponse {
+    let workload_id = match request.params.get("workload_id").and_then(|v| v.as_str()) {
+        Some(w) if !w.is_empty() => w,
+        _ => return JsonRpcResponse::error("workload_id is required"),
+    };
+    let nonce_hex = match request.params.get("nonce_hex").and_then(|v| v.as_str()) {
+        Some(n) if !n.is_empty() => n,
+        _ => return JsonRpcResponse::error("nonce_hex is required"),
+    };
+    // peer_pk is optional. Accept either raw base64 string or an empty/missing
+    // field. When present, decoded bytes are hashed into report_data by the
+    // shared bundle builder.
+    let peer_pk_b64 = request
+        .params
+        .get("peer_pk")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let peer_pk = if peer_pk_b64.is_empty() {
+        Vec::new()
+    } else {
+        match base64::engine::general_purpose::STANDARD.decode(peer_pk_b64) {
+            Ok(b) => b,
+            Err(e) => return JsonRpcResponse::error(format!("peer_pk base64 decode: {e}")),
+        }
+    };
+
+    let bundle = match build_attest_bundle(spec_store, quoter, workload_id, nonce_hex, &peer_pk) {
+        Ok(b) => b,
+        Err(status) => return JsonRpcResponse::error(status.message().to_owned()),
+    };
+
+    let result = serde_json::json!({
+        "workload_id": bundle.workload_id,
+        "cgroup_path": bundle.cgroup_path,
+        "nonce_hex": bundle.nonce_hex,
+        "td_quote": base64::engine::general_purpose::STANDARD.encode(&bundle.td_quote),
+        "event_log": base64::engine::general_purpose::STANDARD.encode(&bundle.event_log),
+        "report_data_hex": bundle.report_data_hex,
+        "timestamp": bundle.timestamp,
+    });
+    JsonRpcResponse::success(result)
 }
 
 fn handle_get_container_state(request: &JsonRpcRequest, state: &StateManager) -> JsonRpcResponse {
@@ -264,6 +321,7 @@ mod tests {
             &state,
             &FakeQuoter::default(),
             &FakeRestarter::default(),
+            &SpecStore::new(),
             "0.1.0",
             Instant::now(),
         );
@@ -289,6 +347,7 @@ mod tests {
             &state,
             &FakeQuoter::default(),
             &FakeRestarter::default(),
+            &SpecStore::new(),
             "0.1.0",
             Instant::now(),
         );
@@ -310,6 +369,7 @@ mod tests {
             &state,
             &FakeQuoter::default(),
             &FakeRestarter::default(),
+            &SpecStore::new(),
             "0.1.0",
             Instant::now(),
         );
@@ -334,6 +394,7 @@ mod tests {
             &state,
             &quoter,
             &FakeRestarter::default(),
+            &SpecStore::new(),
             "0.1.0",
             Instant::now(),
         );
@@ -357,6 +418,7 @@ mod tests {
             &state,
             &quoter,
             &FakeRestarter::default(),
+            &SpecStore::new(),
             "0.1.0",
             Instant::now(),
         );
@@ -381,6 +443,7 @@ mod tests {
             &state,
             &quoter,
             &FakeRestarter::default(),
+            &SpecStore::new(),
             "0.1.0",
             Instant::now(),
         );
@@ -403,6 +466,7 @@ mod tests {
             &state,
             &FakeQuoter::default(),
             &FakeRestarter::default(),
+            &SpecStore::new(),
             "0.1.0",
             started,
         );
@@ -427,6 +491,7 @@ mod tests {
             &state,
             &FakeQuoter::default(),
             &restarter,
+            &SpecStore::new(),
             "0.1.0",
             Instant::now(),
         );
@@ -454,6 +519,7 @@ mod tests {
             &state,
             &FakeQuoter::default(),
             &FakeRestarter::default(),
+            &SpecStore::new(),
             "0.1.0",
             Instant::now(),
         );
@@ -475,6 +541,7 @@ mod tests {
             &state,
             &FakeQuoter::default(),
             &FakeRestarter::default(),
+            &SpecStore::new(),
             "0.1.0",
             Instant::now(),
         );
@@ -496,6 +563,7 @@ mod tests {
             &state,
             &FakeQuoter::default(),
             &FakeRestarter::default(),
+            &SpecStore::new(),
             "0.1.0",
             Instant::now(),
         );

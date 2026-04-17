@@ -179,9 +179,21 @@ impl ContainerRuntime for DockerRuntime {
         let mut labels_map = spec.labels.clone();
         labels_map.insert("trustd.managed".into(), "true".into());
 
+        // Inject the stable workload identity so in-container relying parties
+        // (e.g. MCP fork's TrustdClient.attest_workload) can find themselves
+        // without the operator having to set it explicitly. If the operator
+        // already set it in spec.env, theirs wins.
+        let mut env = spec.env.clone();
+        let has_workload_id_env = env
+            .iter()
+            .any(|v| v.starts_with("TEE_MCP_WORKLOAD_ID="));
+        if !has_workload_id_env && !spec.name.is_empty() {
+            env.push(format!("TEE_MCP_WORKLOAD_ID={}", spec.name));
+        }
+
         let config: Config<String> = Config {
             image: Some(spec.image.clone()),
-            env: Some(spec.env.clone()),
+            env: Some(env),
             labels: Some(labels_map),
             host_config: Some(host_config),
             ..Default::default()
