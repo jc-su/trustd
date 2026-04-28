@@ -4,6 +4,7 @@ use clap::{Parser, ValueEnum};
 
 use crate::securityfs::{DEFAULT_ATTEST_PATH, DEFAULT_RTMR_PATH};
 use crate::tdquote::DEFAULT_TSM_BASE_PATH;
+use crate::vsock_quote::{DEFAULT_QGS_VSOCK_CID, DEFAULT_QGS_VSOCK_PORT};
 
 /// Controls how aggressively trustd drives the measurement + remediation
 /// loop. Orthogonal to the AttestWorkload RPC,
@@ -34,6 +35,31 @@ impl MeasurementMode {
     pub fn remediation_enabled(self) -> bool {
         matches!(self, MeasurementMode::Enforce)
     }
+}
+
+/// Selects the backend that builds TDX quotes for `attest_workload`.
+///
+/// `Tsm` is the upstream-Linux TSM `configfs` path (writes `inblob`, reads
+/// `outblob` under `/sys/kernel/config/tsm/report/<name>/`). It serializes
+/// quote-gen behind the kernel's `wait_for_quote_completion()` loop, which
+/// hard-codes `msleep_interruptible(MSEC_PER_SEC)` — so every call takes
+/// ~1024 ms regardless of how fast QGS actually responds. This was the v1
+/// baseline path.
+///
+/// `Vsock` is the Intel-recommended R3AAL-style path: TDREPORT via
+/// `ioctl(/dev/tdx_guest, TDX_CMD_GET_REPORT0)` and quote via a direct
+/// AF_VSOCK connection to QGS at (`qgs-vsock-cid`, `qgs-vsock-port`).
+/// Empirically ~3.8 ms median on this host (270× faster). The trust
+/// boundary is unchanged: trustd still binds workload_id, report_data and
+/// event_log; only the quote backend swaps.
+///
+/// `Auto` picks `Vsock` when `/dev/tdx_guest` exists, else falls back to
+/// `Tsm`. Useful for hybrid environments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum QuoteBackend {
+    Tsm,
+    Vsock,
+    Auto,
 }
 
 pub const DEFAULT_VSOCK_PORT: u32 = 1235;
@@ -97,4 +123,21 @@ pub struct Config {
     /// side-effects killing a running experiment.
     #[arg(long, value_enum, default_value_t = MeasurementMode::Enforce)]
     pub measurement_mode: MeasurementMode,
+
+    /// Which backend trustd uses to build TDX quotes. See [`QuoteBackend`].
+    /// Default `Auto` prefers vsock-direct (much faster, no kernel poll)
+    /// when `/dev/tdx_guest` is available, otherwise falls back to TSM.
+    #[arg(long, value_enum, default_value_t = QuoteBackend::Auto)]
+    pub quote_backend: QuoteBackend,
+
+    /// AF_VSOCK CID of the QGS daemon. Default 2 (`VMADDR_CID_HOST`) — the
+    /// host. Override only if QGS runs in a different attestation namespace.
+    #[arg(long, default_value_t = DEFAULT_QGS_VSOCK_CID)]
+    pub qgs_vsock_cid: u32,
+
+    /// AF_VSOCK port the QGS daemon listens on. Default 4050 — the port
+    /// QEMU's `-object {"qom-type":"tdx-quote-generation-service",...}`
+    /// element exposes on Canonical Ubuntu TDX hosts.
+    #[arg(long, default_value_t = DEFAULT_QGS_VSOCK_PORT)]
+    pub qgs_vsock_port: u32,
 }

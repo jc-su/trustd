@@ -119,9 +119,68 @@ fn dispatch<Q: QuoteProvider>(
         "GetTDQuote" => handle_get_td_quote(request, quoter),
         "RestartContainer" => handle_restart_container(request, restarter),
         "AttestWorkload" => handle_attest_workload(request, spec_store, quoter),
+        "VerifyRtmr3" => handle_verify_rtmr3(request, state, spec_store),
         "Ping" => handle_ping(state, version, started_at),
         other => JsonRpcResponse::error(format!("unknown method: {other}")),
     }
+}
+
+/// Fast per-tool RTMR3 check used by the MCP SDK's `quote_mode` ablation.
+/// Resolves `workload_id` → cgroup via SpecStore, fetches current RTMR3 from
+/// the StateManager cache (populated by the securityfs watcher), compares to
+/// `expected_rtmr3_hex`. No QGS round-trip — O(microseconds).
+///
+/// Request:   `{ "workload_id": "trustweave-mcp-0", "expected_rtmr3_hex": "..." }`
+/// Response:  `{ "match": bool, "current_rtmr3_hex": "...", "workload_id": "..." }`
+///
+/// When `expected_rtmr3_hex` is all-zeros the caller is asking for a
+/// "snapshot only" reading — `match` will be false but `current_rtmr3_hex`
+/// gives the caller a value to cache for subsequent verifications. This lets
+/// MCP-side `quote_mode=per_tool_first` snapshot-then-verify with a single
+/// RPC shape.
+fn handle_verify_rtmr3(
+    request: &JsonRpcRequest,
+    state: &StateManager,
+    spec_store: &SpecStore,
+) -> JsonRpcResponse {
+    let workload_id = match request.params.get("workload_id").and_then(|v| v.as_str()) {
+        Some(w) if !w.is_empty() => w,
+        _ => return JsonRpcResponse::error("workload_id is required"),
+    };
+    let expected_hex = match request
+        .params
+        .get("expected_rtmr3_hex")
+        .and_then(|v| v.as_str())
+    {
+        Some(h) => h.trim().to_lowercase(),
+        None => return JsonRpcResponse::error("expected_rtmr3_hex is required"),
+    };
+    if expected_hex.len() != 96 {
+        return JsonRpcResponse::error(format!(
+            "expected_rtmr3_hex must be 96 hex chars (48 bytes), got {}",
+            expected_hex.len()
+        ));
+    }
+
+    let Some(cgroup_path) = spec_store.cgroup_for_name(workload_id) else {
+        return JsonRpcResponse::error(format!(
+            "no container registered for workload_id: {workload_id}"
+        ));
+    };
+
+    let Some(container) = state.get(&cgroup_path) else {
+        return JsonRpcResponse::error(format!("container not found: {cgroup_path}"));
+    };
+
+    let current_hex = container.rtmr3.to_lowercase();
+    let is_match = current_hex == expected_hex;
+
+    JsonRpcResponse::success(serde_json::json!({
+        "match": is_match,
+        "current_rtmr3_hex": current_hex,
+        "workload_id": workload_id,
+        "cgroup_path": cgroup_path,
+    }))
 }
 
 fn handle_attest_workload<Q: QuoteProvider>(

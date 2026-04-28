@@ -23,8 +23,10 @@ use trustd::securityfs::{Attestor, KernelSecurityFsAttestor, KernelSecurityFsRea
 use trustd::service::TrustdService;
 use trustd::spec_store::SpecStore;
 use trustd::state::StateManager;
-use trustd::tdquote::{QuoteProvider, TsmQuoter};
+use trustd::config::QuoteBackend;
+use trustd::tdquote::{DynQuoter, QuoteProvider, TsmQuoter};
 use trustd::unix_rpc;
+use trustd::vsock_quote::{TDX_GUEST_DEVICE, VsockQuoter};
 use trustd::watcher::MeasurementWatcher;
 
 #[cfg(not(feature = "vsock"))]
@@ -41,7 +43,37 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let events = EventBus::new(1024);
     let attestor = Arc::new(KernelSecurityFsAttestor::new(config.attest_path.clone()));
     let reader = Arc::new(KernelSecurityFsReader::new(config.rtmr_path.clone()));
-    let quoter = Arc::new(TsmQuoter::new(config.tsm_path.clone()));
+    // Backend selection — `Tsm` keeps the configfs-tsm path (1-sec kernel
+    // poll, ≈1024 ms/quote) so existing v1 baselines remain reproducible.
+    // `Vsock` switches to the AF_VSOCK QGS path documented in the Intel
+    // TDX DCAP Quote Library API spec (≈3-6 ms/quote, no kernel poll).
+    // `Auto` prefers vsock when /dev/tdx_guest is present.
+    let quoter = Arc::new(match config.quote_backend {
+        QuoteBackend::Tsm => DynQuoter::Tsm(TsmQuoter::new(config.tsm_path.clone())),
+        QuoteBackend::Vsock => DynQuoter::Vsock(VsockQuoter::new(
+            config.qgs_vsock_cid,
+            config.qgs_vsock_port,
+        )),
+        QuoteBackend::Auto => {
+            if std::path::Path::new(TDX_GUEST_DEVICE).exists() {
+                info!(
+                    cid = config.qgs_vsock_cid,
+                    port = config.qgs_vsock_port,
+                    "quote backend: vsock-direct (auto-selected; /dev/tdx_guest present)"
+                );
+                DynQuoter::Vsock(VsockQuoter::new(
+                    config.qgs_vsock_cid,
+                    config.qgs_vsock_port,
+                ))
+            } else {
+                info!(
+                    path = %config.tsm_path.display(),
+                    "quote backend: TSM configfs (auto-selected; /dev/tdx_guest missing)"
+                );
+                DynQuoter::Tsm(TsmQuoter::new(config.tsm_path.clone()))
+            }
+        }
+    });
     let restarter = Arc::new(CgroupProcessRestarter::default());
 
     let mut service = TrustdService::new(

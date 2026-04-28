@@ -112,28 +112,46 @@ impl DockerRuntime {
     }
 
     /// Resolve the cgroup path for a running container.
+    ///
+    /// Reads `/proc/<pid>/cgroup` off the container's init pid — authoritative
+    /// regardless of docker's cgroup driver. cgroup v2 lines look like
+    /// `0::/system.slice/docker-<id>.scope` (systemd) or `0::/docker/<id>`
+    /// (cgroupfs). Falls back to a driver-heuristic string on failure so
+    /// older callers still get *something* useful.
     async fn resolve_cgroup(&self, name: &str) -> String {
-        match self.client.inspect_container(name, None::<InspectContainerOptions>).await {
-            Ok(info) => {
-                // Docker's inspect returns host_config.cgroup_parent for the
-                // parent, and the container's own cgroup is a child of it.
-                // For systemd cgroup driver: /system.slice/docker-<id>.scope
-                // For cgroupfs driver: /docker/<id>
-                let id = info.id.unwrap_or_default();
-                let parent = info
-                    .host_config
-                    .and_then(|h| h.cgroup_parent)
-                    .unwrap_or_default();
-                if parent.is_empty() {
-                    format!("/docker/{}", id)
-                } else {
-                    format!("{}/docker-{}.scope", parent, &id[..12.min(id.len())])
+        let info = match self.client.inspect_container(name, None::<InspectContainerOptions>).await {
+            Ok(i) => i,
+            Err(e) => {
+                warn!(error = %e, container = %name, "failed to inspect container for cgroup");
+                return String::new();
+            }
+        };
+        let pid = info.state.as_ref().and_then(|s| s.pid).unwrap_or(0);
+        if pid > 0 {
+            let path = format!("/proc/{}/cgroup", pid);
+            if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                // cgroup v2 has a single line `0::/<path>`; v1 has many. The
+                // unified hierarchy (v2) entry is the one the IMA patch keys on.
+                for line in content.lines() {
+                    if let Some(rest) = line.strip_prefix("0::") {
+                        let trimmed = rest.trim();
+                        if !trimmed.is_empty() {
+                            return trimmed.to_string();
+                        }
+                    }
                 }
             }
-            Err(e) => {
-                warn!(error = %e, container = %name, "failed to resolve cgroup");
-                String::new()
-            }
+        }
+        // Fallback: synthesize from inspect (pre-start containers have no pid).
+        let id = info.id.unwrap_or_default();
+        let parent = info
+            .host_config
+            .and_then(|h| h.cgroup_parent)
+            .unwrap_or_default();
+        if parent.is_empty() {
+            format!("/docker/{}", id)
+        } else {
+            format!("{}/docker-{}.scope", parent, &id[..12.min(id.len())])
         }
     }
 }
@@ -167,12 +185,18 @@ impl ContainerRuntime for DockerRuntime {
             }
         }
 
+        // Auto-bind trustd's Unix socket so the workload's TrustedMCP client
+        // (mcp-sdk-fork's TrustdClient, default path /run/trustd.sock) can
+        // reach us. Without this, TEE-on workloads abort at startup with
+        // "Neither attestation authority nor trustd is available". Cheap to
+        // mount unconditionally — non-TEE containers simply won't read it.
         let host_config = HostConfig {
             network_mode: if spec.network_host {
                 Some("host".into())
             } else {
                 None
             },
+            binds: Some(vec!["/run/trustd.sock:/run/trustd.sock".to_string()]),
             ..Default::default()
         };
 

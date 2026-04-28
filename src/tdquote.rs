@@ -3,13 +3,48 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::error::{AgentError, Result};
+use crate::vsock_quote::VsockQuoter;
 
-pub const DEFAULT_TSM_BASE_PATH: &str = "/sys/kernel/config/tsm_report";
+// Linux 6.6+ kernel exposes the TSM configfs report dir at
+// "/sys/kernel/config/tsm/report". Pre-merge dev kernels used the flat
+// "tsm_report" directory; our 6.6.63+ guest uses the modern path.
+pub const DEFAULT_TSM_BASE_PATH: &str = "/sys/kernel/config/tsm/report";
 pub const REPORT_NAME: &str = "trustd";
 
 pub trait QuoteProvider: Send + Sync {
     fn available(&self) -> bool;
     fn get_quote(&self, report_data: &[u8]) -> Result<Vec<u8>>;
+}
+
+/// Static-dispatch wrapper over the two concrete quote backends.
+///
+/// trustd's pipeline (`service.rs`, `unix_rpc.rs`, `main.rs`) is generic
+/// over `Q: QuoteProvider + 'static`. We want to pick the backend at
+/// runtime from `--quote-backend`, but generic monomorphization needs a
+/// single concrete type. An enum with a `QuoteProvider` impl that branches
+/// on the variant gives us runtime selection without converting every
+/// call site to `Arc<dyn QuoteProvider>` (which would force `?Sized`
+/// bounds on a dozen signatures).
+#[derive(Debug)]
+pub enum DynQuoter {
+    Tsm(TsmQuoter),
+    Vsock(VsockQuoter),
+}
+
+impl QuoteProvider for DynQuoter {
+    fn available(&self) -> bool {
+        match self {
+            DynQuoter::Tsm(q) => q.available(),
+            DynQuoter::Vsock(q) => q.available(),
+        }
+    }
+
+    fn get_quote(&self, report_data: &[u8]) -> Result<Vec<u8>> {
+        match self {
+            DynQuoter::Tsm(q) => q.get_quote(report_data),
+            DynQuoter::Vsock(q) => q.get_quote(report_data),
+        }
+    }
 }
 
 #[derive(Debug)]
